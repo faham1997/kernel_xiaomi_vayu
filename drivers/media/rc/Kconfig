@@ -292,6 +292,15 @@ config IR_SPI
 	  To compile this driver as a module, choose M here: the module will be
 	  called ir-spi.
 
+config IR_SPI_MI
+	tristate "SPI connected IR LED"
+	depends on SPI && LIRC
+	---help---
+	  Say Y if you want to use an IR LED connected through SPI bus.
+
+	  To compile this driver as a module, choose M here: the module will be
+	  called ir-spi-mi.
+
 config IR_STREAMZAP
 	tristate "Streamzap PC Remote IR Receiver"
 	depends on USB_ARCH_HAS_HCD
@@ -481,5 +490,16 @@ config IR_ZX
 	   module will be called zx-irdec.
 
 endif #RC_DEVICES
+
+config IR_MSM_GENI
+	tristate "MSM GENI IR Controller"
+	depends on RC_CORE
+	default m
+	---help---
+	   Say Y here to enable support for integrated infrared module
+	   for MSM family processors.
+
+	   To compile this driver as a module, choose M here: the
+	   module will be called msm-geni-ir.
 
 endif #RC_CORE

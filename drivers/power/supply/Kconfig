@@ -610,4 +610,10 @@ config CHARGER_RT9455
 	help
 	  Say Y to enable support for Richtek RT9455 battery charger.
 
+source "drivers/power/supply/qcom/Kconfig"
+
+# vayu
+source "drivers/power/supply/maxim_vayu/Kconfig"
+source "drivers/power/supply/ti_vayu/Kconfig"
+
 endif # POWER_SUPPLY

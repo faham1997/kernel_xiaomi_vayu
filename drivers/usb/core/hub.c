@@ -18,6 +18,7 @@
 #include <linux/sched/mm.h>
 #include <linux/list.h>
 #include <linux/slab.h>
+#include <linux/kcov.h>
 #include <linux/ioctl.h>
 #include <linux/usb.h>
 #include <linux/usbdevice_fs.h>
@@ -40,6 +41,8 @@
 #define HUB_QUIRK_CHECK_PORT_AUTOSUSPEND	0x01
 #define HUB_QUIRK_DISABLE_AUTOSUSPEND		0x02
 
+int deny_new_usb __read_mostly = 0;
+
 /* Protect struct usb_device->state and ->children members
  * Note: Both are also protected by ->dev.sem, except that ->state can
  * change to USB_STATE_NOTATTACHED even when the semaphore isn't held. */
@@ -51,6 +54,11 @@ static void hub_event(struct work_struct *work);
 
 /* synchronize hub-port add/remove and peering operations */
 DEFINE_MUTEX(usb_port_peer_mutex);
+
+static bool skip_extended_resume_delay = 1;
+module_param(skip_extended_resume_delay, bool, 0644);
+MODULE_PARM_DESC(skip_extended_resume_delay,
+		"removes extra delay added to finish bus resume");
 
 /* cycle leds on hubs that aren't blinking for attention */
 static bool blinkenlights;
@@ -641,6 +649,12 @@ void usb_kick_hub_wq(struct usb_device *hdev)
 	if (hub)
 		kick_hub_wq(hub);
 }
+
+void usb_flush_hub_wq(void)
+{
+	flush_workqueue(hub_wq);
+}
+EXPORT_SYMBOL(usb_flush_hub_wq);
 
 /*
  * Let the USB core know that a USB 3.0 device has sent a Function Wake Device
@@ -3488,7 +3502,10 @@ int usb_port_resume(struct usb_device *udev, pm_message_t msg)
 		/* drive resume for USB_RESUME_TIMEOUT msec */
 		dev_dbg(&udev->dev, "usb %sresume\n",
 				(PMSG_IS_AUTO(msg) ? "auto-" : ""));
-		msleep(USB_RESUME_TIMEOUT);
+		if (!skip_extended_resume_delay ||
+				udev->parent != udev->bus->root_hub)
+			usleep_range(USB_RESUME_TIMEOUT * 1000,
+					(USB_RESUME_TIMEOUT + 1) * 1000);
 
 		/* Virtual root hubs can trigger on GET_PORT_STATUS to
 		 * stop resume signaling.  Then finish the resume
@@ -3497,7 +3514,7 @@ int usb_port_resume(struct usb_device *udev, pm_message_t msg)
 		status = hub_port_status(hub, port1, &portstatus, &portchange);
 
 		/* TRSMRCY = 10 msec */
-		msleep(10);
+		usleep_range(10000, 10500);
 	}
 
  SuspendCleared:
@@ -3618,6 +3635,7 @@ static int hub_suspend(struct usb_interface *intf, pm_message_t msg)
 {
 	struct usb_hub		*hub = usb_get_intfdata(intf);
 	struct usb_device	*hdev = hub->hdev;
+	struct usb_hcd		*hcd = bus_to_hcd(hdev->bus);
 	unsigned		port1;
 	int			status;
 
@@ -3651,6 +3669,9 @@ static int hub_suspend(struct usb_interface *intf, pm_message_t msg)
 	}
 
 	if (hub_is_superspeed(hdev) && hdev->do_remote_wakeup) {
+		if (!hdev->parent && hcd->primary_hcd)
+			usb_phy_powerup(hcd->primary_hcd->usb3_phy);
+
 		/* Enable hub to send remote wakeup for all ports. */
 		for (port1 = 1; port1 <= hdev->maxchild; port1++) {
 			status = set_port_feature(hdev,
@@ -3660,6 +3681,9 @@ static int hub_suspend(struct usb_interface *intf, pm_message_t msg)
 					USB_PORT_FEAT_REMOTE_WAKE_OVER_CURRENT,
 					USB_PORT_FEAT_REMOTE_WAKE_MASK);
 		}
+
+		if (!hdev->parent && hcd->primary_hcd)
+			usb_phy_powerdown(hcd->primary_hcd->usb3_phy);
 	}
 
 	dev_dbg(&intf->dev, "%s\n", __func__);
@@ -4347,6 +4371,7 @@ static int hub_set_address(struct usb_device *udev, int devnum)
 	return retval;
 }
 
+#ifndef CONFIG_MACH_XIAOMI_SM8150
 /*
  * There are reports of USB 3.0 devices that say they support USB 2.0 Link PM
  * when they're plugged into a USB 2.0 port, but they don't work when LPM is
@@ -4373,6 +4398,7 @@ static void hub_set_initial_usb2_lpm_policy(struct usb_device *udev)
 		usb_enable_usb2_hardware_lpm(udev);
 	}
 }
+#endif
 
 static int hub_enable_device(struct usb_device *udev)
 {
@@ -4410,6 +4436,8 @@ hub_port_init(struct usb_hub *hub, struct usb_device *udev, int port1,
 	const char		*speed;
 	int			devnum = udev->devnum;
 	const char		*driver_name;
+	char			*error_event[] = {
+				"USB_DEVICE_ERROR=Device_No_Response", NULL };
 
 	/* root hub ports have a slightly longer reset period
 	 * (from USB 2.0 spec, section 7.1.7.5)
@@ -4597,6 +4625,8 @@ hub_port_init(struct usb_hub *hub, struct usb_device *udev, int port1,
 				if (r != -ENODEV)
 					dev_err(&udev->dev, "device descriptor read/64, error %d\n",
 							r);
+				kobject_uevent_env(&udev->parent->dev.kobj,
+						KOBJ_CHANGE, error_event);
 				retval = -EMSGSIZE;
 				continue;
 			}
@@ -4649,6 +4679,8 @@ hub_port_init(struct usb_hub *hub, struct usb_device *udev, int port1,
 				dev_err(&udev->dev,
 					"device descriptor read/8, error %d\n",
 					retval);
+			kobject_uevent_env(&udev->parent->dev.kobj,
+						KOBJ_CHANGE, error_event);
 			if (retval >= 0)
 				retval = -EMSGSIZE;
 		} else {
@@ -4719,7 +4751,9 @@ hub_port_init(struct usb_hub *hub, struct usb_device *udev, int port1,
 	/* notify HCD that we have a device connected and addressed */
 	if (hcd->driver->update_device)
 		hcd->driver->update_device(hcd, udev);
+#ifndef CONFIG_MACH_XIAOMI_SM8150
 	hub_set_initial_usb2_lpm_policy(udev);
+#endif
 fail:
 	if (retval) {
 		hub_port_disable(hub, port1, 0);
@@ -4864,6 +4898,12 @@ static void hub_port_connect(struct usb_hub *hub, int port1, u16 portstatus,
 			goto done;
 		return;
 	}
+
+	if (deny_new_usb) {
+		dev_err(&port_dev->dev, "denied insert of USB device on port %d\n", port1);
+		goto done;
+	}
+
 	if (hub_is_superspeed(hub->hdev))
 		unit_load = 150;
 	else
@@ -5208,6 +5248,8 @@ static void hub_event(struct work_struct *work)
 	hub_dev = hub->intfdev;
 	intf = to_usb_interface(hub_dev);
 
+	kcov_remote_start_usb((u64)hdev->bus->busnum);
+
 	dev_dbg(hub_dev, "state %d ports %d chg %04x evt %04x\n",
 			hdev->state, hdev->maxchild,
 			/* NOTE: expects max 15 ports... */
@@ -5314,6 +5356,8 @@ out_hdev_lock:
 	/* Balance the stuff in kick_hub_wq() and allow autosuspend */
 	usb_autopm_put_interface(intf);
 	kref_put(&hub->kref, hub_release);
+
+	kcov_remote_stop();
 }
 
 static const struct usb_device_id hub_id_table[] = {
